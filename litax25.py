@@ -146,15 +146,39 @@ class downsample(Module):
             self.valid_out.eq(0)
         )
 
+class sample_queue(Module):
+    def __init__(self, params):
+        self.valid_in   = Signal()
+        self.data_in    = Signal(params.ds_truncated_width)
+        self.data_out   = Signal(params.ds_truncated_width)
+        self.queue_data = Array(Signal(params.ds_truncated_width) for _ in range(params.samples_per_symbol))
+        self.tail       = Signal(int(np.ceil(np.log2(params.samples_per_symbol))))
+        self.read_idx   = Signal(int(np.ceil(np.log2(params.samples_per_symbol))))
+
+        self.ios = {self.read_idx, self.valid_in, self.data_in, self.data_out, self.tail}
+
+        self.comb += self.data_out.eq(self.queue_data[self.read_idx])
+        self.sync += If(self.valid_in,
+            self.queue_data[self.tail].eq(self.data_in),
+            If(self.tail >= params.samples_per_symbol,
+                self.tail.eq(0)
+            ).Else(
+                self.tail.eq(self.tail + 1)
+            )
+        )
+
+
 class demodulator(Module):
     def __init__(self, params):
         self.miso       = Signal()
         self.cs         = Signal()
         self.sck        = Signal()
-        self.valid_out  = Signal()
-        self.data_out   = Signal(params.downsampled_width)
+        #self.valid_out  = Signal()
+        #self.data_out   = Signal(params.downsampled_width)
+        self.data_out   = Signal(params.ds_truncated_width)
+        self.queue_idx  = Signal(int(np.ceil(np.log2(params.samples_per_symbol))))
 
-        self.ios = {self.miso, self.cs, self.data_out, self.valid_out, self.sck}
+        self.ios = {self.miso, self.cs, self.sck, self.data_out}
 
         #ADC/SPI controller
         adc_spi_interface = adc_spi(params)
@@ -174,15 +198,29 @@ class demodulator(Module):
         self.comb += downsampler.valid_in.eq(adc_spi_interface.data_valid)
         self.comb += downsampler.data_in.eq(adc_spi_interface.adc_data)
 
-        self.comb += self.valid_out.eq(downsampler.valid_out)
-        self.comb += self.data_out.eq(downsampler.data_out)
+        queue = sample_queue(params)
+        self.submodules += queue
+
+        self.comb += queue.valid_in.eq(downsampler.valid_out)
+        self.comb += queue.data_in.eq(downsampler.data_out[params.downsampled_width - params.ds_truncated_width:])
+        self.comb += queue.read_idx.eq(self.queue_idx)
+
+        #self.comb += self.valid_out.eq(downsampler.valid_out)
+        #self.comb += self.data_out.eq(downsampler.data_out)
+
+        self.comb += self.data_out.eq(queue.data_out)
+        self.sync += If(self.queue_idx >= params.samples_per_symbol,
+            self.queue_idx.eq(0)
+        ).Else(
+            self.queue_idx.eq(self.queue_idx + 1)
+        )
 
 class adc_tb_top(Module):
     def __init__(self, params):
-        self.data_valid = Signal()
+        #self.data_valid = Signal()
         self.data_out   = Signal(params.downsampled_width)
         
-        self.ios = {self.data_valid, self.data_out}
+        self.ios = {self.data_out}
 
         #Design Under Test - talk to TB ADC model and demodulate the signal
         dut = demodulator(params)
@@ -204,8 +242,9 @@ class adc_tb_top(Module):
         self.comb += tb.cs.eq(dut.cs) #chip select for the ADC TB model
 
         #DUT/top level connections - just for test
-        self.comb += self.data_valid.eq(dut.valid_out)
-        self.sync += If(dut.valid_out, self.data_out.eq(dut.data_out))
+        #self.comb += self.data_valid.eq(dut.valid_out)
+        #self.sync += If(dut.valid_out, self.data_out.eq(dut.data_out))
+        self.comb += self.data_out.eq(dut.data_out)
 
 class dsp_params:
     def __init__(self):
@@ -238,6 +277,10 @@ class dsp_params:
         #calculate the quotient to get the average of the last N samples because the amplitude is
         #arbitrary - but we do need enough bits to represent the sum of the last N samples
         self.downsampled_width = int(np.ceil(np.log2(self.downsample_count))) + self.adc_bit_width
+
+        #let's truncate some of the less significant bits after downsampling - they're mostly noise
+        #and extra bits here costs extra logic or delay in the multipliers
+        self.ds_truncated_width = 8
 
         #AX.25 frequencies for bit 1/bit 0 symbols, Hz
         self.f1 = 1200.
